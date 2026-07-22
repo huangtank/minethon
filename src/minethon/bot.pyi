@@ -4,15 +4,15 @@
 # This file is the IDE completion overlay for src/minethon/bot.py.
 # Runtime behavior lives in bot.py; types live here.
 #
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\mineflayer--342e33372e30\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\vec3--302e312e3130\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\prismarine-entity\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\prismarine-block\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\prismarine-item\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\prismarine-chat\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\prismarine-windows\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\prismarine-recipe\index.d.ts
-# Ref: .venv\Lib\site-packages\javascript\js\node_modules\mineflayer-pathfinder--322e342e35\index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/mineflayer--342e33372e30/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/vec3--302e312e3130/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/prismarine-entity/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/prismarine-block/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/prismarine-item/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/prismarine-chat/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/prismarine-windows/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/prismarine-recipe/index.d.ts
+# Ref: .venv/.../site-packages/javascript/js/node_modules/mineflayer-pathfinder--322e342e35/index.d.ts
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
@@ -2820,13 +2820,13 @@ class Bot:
     def get_block_property(
         self, x: int, y: int, z: int, property_name: str
     ) -> str | int | bool | None:
-        """獲取指定座標方塊的特定狀態屬性 True or False；若方塊未載入或無此屬性則回傳 None。
+        """取得指定座標塊的狀態屬性；塊未載入或沒有此屬性時回傳`None`
 
         Args:
             x: 方塊 X 整數座標
             y: 方塊 Y 整數座標
             z: 方塊 Z 整數座標
-            property_name: 屬性名稱（例如 "lit", "facing", "powered"）
+            property_name: 屬性名稱，例如 `"lit"` 或 `"facing"`
         """
 
     def look_block(self) -> tuple[tuple[int, int, int], str] | None:
@@ -2954,13 +2954,15 @@ class Bot:
     def dig(self) -> tuple[tuple[int, int, int], str] | None:
         """挖掉準心正對著的方塊，回傳被挖方塊的 `((x, y, z), 名稱)`
 
-        沒對到任何方塊時回傳 `None`。（這是把原本的 break 動作改名為 dig。）
+        沒瞄準任何方塊時，會改挖「正前方一格」的固體方塊；兩者都沒有才回傳
+        `None`。太硬挖不完的方塊（例如徒手挖黑曜石）不會挖，印一行提示後回傳
+        `None`。（這是把原本的 break 動作改名為 dig。）
         """
 
     def place(self) -> tuple[tuple[int, int, int], str] | None:
         """在準心對著的面上放一個手上的方塊，回傳新方塊的 `((x, y, z), 名稱)`
 
-        沒對到任何方塊時回傳 `None`。
+        沒對到任何方塊、或手上是空的（先用 `hold(...)` 拿東西）時回傳 `None`。
         """
 
     def use(self) -> bool:
@@ -2969,12 +2971,23 @@ class Bot:
         永遠回傳 `True`。
         """
 
+    def use_player(self, username: str) -> bool:
+        """面向指定玩家實體的中心並互動
+
+        會使用玩家當下的位置與實體高度，所以不需要自行計算 yaw、pitch 或堆疊層高。
+        成功送出互動時回傳 `True`；若玩家不在線、不同世界，或不在機器人的已載入
+        實體範圍內，則丟出 `PlayerNotFoundError`。實際互動距離仍由伺服器判定。
+
+        Args:
+            username: 要互動的玩家名稱
+        """
+
     def action(self, name: str, value: int | None = ...) -> None:
         """請伺服器執行具名任務動作 `name`（例如 `"put out"` 滅火）
 
         實際送出 vanilla `/trigger <帳號>_<動作>`（全部小寫、空格與連字號轉底線），
-        例如帳號 `G1_labfire` 呼叫 `action("put out")` 會送
-        `/trigger g1_labfire_put_out`。動作是否生效由伺服器判斷
+        例如帳號 `G1_labfire_1` 呼叫 `action("put out")` 會送
+        `/trigger g1_labfire_1_put_out`。動作是否生效由伺服器判斷
         （執行者身分、任務是否開始、前方是否有目標…），客戶端不做任何事、
         也不會動到方塊；名稱含不合法字元丟出 `ValueError`。
 
@@ -3006,6 +3019,7 @@ def create_bot(
     *,
     instruction_sleep: float = ...,
     bypass_instruction_sleep: bool = ...,
+    **options: Unpack[CreateBotOptions],
 ) -> Bot:
     """建立並啟動一個 mineflayer 機器人
 

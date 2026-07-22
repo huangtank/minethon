@@ -20,6 +20,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 import warnings
 from functools import wraps
 from typing import TYPE_CHECKING, Any
@@ -47,12 +48,22 @@ _QUEST_NOT_FOUND = "\n找不到此任務。請檢查任務名稱是否正確，�
 # was disconnected (e.g. killed and kicked) mid-command, leaving JSPyBridge
 # waiting on a dead connection. Rendered instead of the raw JSPyBridge stack.
 _CONNECTION_LOST = "\n與伺服器的連線中斷了，程式結束。"
+# Shown when a single bridge method call hits JSPyBridge's per-call timeout
+# ("Call to 'X' timed out."). Distinct from _CONNECTION_LOST: the connection
+# may be fine and the action simply took too long, so say both possibilities.
+_CALL_TIMEOUT = (
+    "\n指令等不到伺服器回應（逾時）。可能是連線中斷，或這個動作耗時過長，程式結束。"
+)
+# Marker for JSPyBridge's per-method-call timeout. Ref: javascript/proxy.py —
+# "Call to '{attr}' timed out. Increase the timeout by setting ...".
+_CALL_TIMEOUT_MARKER = "timed out. increase the timeout"
 # Substrings JSPyBridge puts in the bare Exceptions it raises when the node
 # bridge stops responding. Ref: javascript/proxy.py + connection.py.
 _BRIDGE_FAILURE_MARKERS = (
     "timed out accessing",
     "execution timed out",
     "process has crashed",
+    _CALL_TIMEOUT_MARKER,
 )
 # Default per-instruction pause (seconds) so a straight-line script's steps are
 # individually visible. Tunable via create_bot(instruction_sleep=...).
@@ -62,23 +73,30 @@ _DEFAULT_INSTRUCTION_SLEEP = 0.2
 _INTERRUPT = {"seen": False}
 
 
-def _stop_with_message(message: str) -> None:
-    """Print ``message`` once and hard-stop the program.
+def _stop_with_message(message: str, *, code: int = 0) -> None:
+    """Print ``message`` once and hard-stop the program with exit ``code``.
 
     Runs on a bridge callback thread (a disconnect, or a login `error`). The
     student's main thread may be parked in run_forever, blocked in wait_spawn
     that will never fire, or deep inside a bridge call on a dead connection — an
     async interrupt can't reliably break those, so we terminate the node bridge
     and exit the process outright. Abrupt, but it guarantees the script stops.
+
+    ``code`` is 0 for a normal end (quit / server closed the session) and 1 for
+    failures (login error, lost bridge), so shells and CI can tell them apart.
+    os._exit skips atexit and buffered writers by design — flush both streams
+    first so the student's own prints aren't lost.
     """
     if _INTERRUPT["seen"]:
         return
     _INTERRUPT["seen"] = True
     print(message, flush=True)  # noqa: T201 — student-facing, intentional
+    with contextlib.suppress(Exception):
+        sys.stderr.flush()
     # Best-effort: terminate the node subprocess so it isn't orphaned.
     with contextlib.suppress(Exception):
         connection.stop()
-    os._exit(0)  # only reliable way out of a blocked bridge call
+    os._exit(code)  # only reliable way out of a blocked bridge call
 
 
 def _looks_like_auth_error(text: str) -> bool:
@@ -110,7 +128,19 @@ def _on_login_error(err: Any) -> None:
     message = (
         _QUEST_NOT_FOUND if _looks_like_auth_error(text) else f"\n連線發生錯誤：{text}"  # noqa: RUF001 — zh-TW fullwidth colon
     )
-    _stop_with_message(message)
+    _stop_with_message(message, code=1)
+
+
+def _on_kicked(reason: Any = None, *_a: Any) -> None:
+    """Print the server's kick reason so it isn't swallowed.
+
+    Runs before the `end` handler's disconnect line. Ref: mineflayer
+    index.d.ts — kicked: (reason: string, loggedIn: boolean).
+    """
+    text = ""
+    with contextlib.suppress(Exception):
+        text = str(reason)
+    print(f"\n機器人被伺服器踢出：{text}", flush=True)  # noqa: T201, RUF001 — student-facing; zh-TW colon
 
 
 def _install_quiet_interrupt() -> None:
@@ -127,19 +157,47 @@ def _install_quiet_interrupt() -> None:
                 _INTERRUPT["seen"] = True
                 print(_GOODBYE)  # noqa: T201 — student-facing, intentional
             return
+        if _CALL_TIMEOUT_MARKER in str(exc).lower():
+            # A single method call timed out — connection may be fine, the
+            # action just outlived the bridge's per-call budget. The late JS
+            # reply can still poison JSPyBridge's IO loop, so exit cleanly
+            # rather than limp on toward a cryptic hang.
+            _stop_with_message(_CALL_TIMEOUT, code=1)
+            return
         if _is_bridge_failure(exc):
             # Bridge went silent mid-command (usually a disconnect). Show a clean
             # line and hard-exit — os._exit also skips the atexit run_forever,
             # which would otherwise time out again on the dead bridge.
-            _stop_with_message(_CONNECTION_LOST)
+            _stop_with_message(_CONNECTION_LOST, code=1)
             return
         previous(exc_type, exc, tb)
 
     sys.excepthook = _hook
 
 
+# Events known to suffer the emitter-shift bug: how many real args each one
+# sends, counted by hand from mineflayer's source — a fact independent of
+# how the user's handler happens to declare its own parameters.
+# chat/whisper: lib/plugins/chat.js:85 (legacy addChatPattern deprecated path)
+# resourcePack: lib/plugins/resource_pack.js (all 3 call sites send exactly 2
+#   args, but the *order* isn't stable — the first positional value is
+#   sometimes `url`, sometimes `uuid`, depending on which branch fires. This
+#   is a separate mineflayer-level quirk; this table only guarantees "how
+#   many", not "which means what", so that part is out of scope here).
+_REAL_ARGC: dict[str, int] = {
+    "chat": 4,
+    "error": 1,
+    "kicked": 2,
+    "whisper": 4,
+    "resourcePack": 2,
+}
+
+
 def _normalize_handler(
-    func: Callable[..., Any], *, emitter: Any | None = None
+    func: Callable[..., Any],
+    *,
+    emitter: Any | None = None,
+    event_name: str | None = None,
 ) -> Callable[..., Any]:
     """Adapt a user handler to mineflayer's loose event-arity conventions.
 
@@ -152,16 +210,27 @@ def _normalize_handler(
 
     This wrapper:
 
-    * drops the leading emitter arg when JSPyBridge injects it — detected
-      either by proxy-identity (``args[0] is emitter``) or by arity excess
-      (``len(args) > slots``), so a proxy-cache change in JSPyBridge that
-      breaks identity still strips the injected emitter when JS emits the
-      arity the handler declares
+    * drops the leading emitter arg when JSPyBridge injects it. The pinned
+      runtime (Node 22+, javascript 1.2.x) never injects — `needsNodePatches`
+      only returns true on Node 14/15 — so detection is deliberately narrow:
+      a known ``_REAL_ARGC`` entry whose observed count matches exactly
+      (``len(args) == real_argc + 1``), or proxy identity
+      (``args[0] is emitter``). Arity excess is **not** treated as injection:
+      a short handler (``def on_chat(self, username, message)``) legitimately
+      receives more real args than it declares, and stripping the first one
+      would hand it the wrong values — excess args are truncated from the
+      end instead.
     * pads missing trailing positional args with ``None``
-    * truncates any excess positional args JS emits
+    * truncates any excess positional args JS emits (from the end)
+    * isolates handler exceptions: a bug in a student handler prints a
+      friendly message plus the traceback and skips that one event, instead
+      of flowing back into JS as an unhandled rejection that kills the node
+      process (Node ≥15 terminates on unhandled rejections) and leaves the
+      script hanging forever.
 
     Ref: mineflayer/lib/plugins/chat.js:85 — chat event emit arity
-    Ref: javascript/__init__.py:78 — optional emitter injection in `On` / `Once`
+    Ref: mineflayer/lib/plugins/resource_pack.js — resourcePack emit arity
+    Ref: javascript/js/bridge.js — needsNodePatches() (emitter injection gate)
     """
     params = list(inspect.signature(func).parameters.values())
     accepts_varargs = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
@@ -171,19 +240,31 @@ def _normalize_handler(
         if p.kind
         in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     )
+    real_argc = _REAL_ARGC.get(event_name) if event_name is not None else None
 
     @wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         if emitter is not None and args:
-            identity_match = args[0] is emitter
-            arity_excess = not accepts_varargs and len(args) > slots
-            if identity_match or arity_excess:
+            if real_argc is not None and len(args) == real_argc + 1:
+                should_strip = True
+            else:
+                should_strip = args[0] is emitter
+            if should_strip:
                 args = args[1:]
-        if accepts_varargs:
-            return func(*args, **kwargs)
-        if len(args) < slots:
-            args = (*args, *([None] * (slots - len(args))))
-        return func(*args[:slots], **kwargs)
+        try:
+            if accepts_varargs:
+                return func(*args, **kwargs)
+            if len(args) < slots:
+                args = (*args, *([None] * (slots - len(args))))
+            return func(*args[:slots], **kwargs)
+        except Exception:  # noqa: BLE001 — must not reach JS as unhandled rejection
+            label = event_name or getattr(func, "__name__", "handler")
+            print(  # noqa: T201 — student-facing, intentional
+                f"\n事件處理發生錯誤（{label}），已略過這一次事件：\n"  # noqa: RUF001 — zh-TW fullwidth colon
+                f"{traceback.format_exc()}",
+                flush=True,
+            )
+            return None
 
     return wrapper
 
@@ -194,6 +275,11 @@ def _normalize_handler(
 _PLUGIN_EXPORT_KEY: dict[str, str] = {
     "mineflayer-pathfinder": "pathfinder",
 }
+
+# User-facing hint when bot.pathfinder is touched before the plugin loads.
+_PATHFINDER_MISSING = (
+    "pathfinder 尚未載入。先呼叫 bot.load_plugin('mineflayer-pathfinder')。"
+)
 
 
 class Bot(Commands):
@@ -231,15 +317,19 @@ class Bot(Commands):
         if name.startswith("_"):
             raise AttributeError(name)
         try:
-            return getattr(self._js, name)
+            value = getattr(self._js, name)
         except AttributeError as exc:
             if name == "pathfinder":
-                msg = (
-                    "pathfinder 尚未載入。先呼叫 "
-                    "bot.load_plugin('mineflayer-pathfinder')。"
-                )
-                raise PluginNotInstalledError(msg) from exc
+                raise PluginNotInstalledError(_PATHFINDER_MISSING) from exc
             raise
+        # The real JSPyBridge proxy returns None for missing JS attributes
+        # instead of raising AttributeError (bridge.js answers 'void' for
+        # undefined), so the except-branch above never fires against a live
+        # bridge — check the value too, or students get a bare
+        # "'NoneType' object has no attribute 'goto'" instead of this hint.
+        if value is None and name == "pathfinder":
+            raise PluginNotInstalledError(_PATHFINDER_MISSING)
+        return value
 
     def load_plugin(
         self,
@@ -338,7 +428,31 @@ class Bot(Commands):
             if impl is None or impl is base_impl:
                 continue
             handler = getattr(handlers, method_name)
-            On(js_bot, event.value)(_normalize_handler(handler, emitter=js_bot))
+            On(js_bot, event.value)(
+                _normalize_handler(handler, emitter=js_bot, event_name=event.value)
+            )
+        # A typo'd handler name (`on_chatt`, `on_Spawn`) silently never fires —
+        # the most common beginner mistake with class-based handlers. Walk the
+        # subclass's own on_* methods and call out any that match no event.
+        known = {f"on_{attr}" for attr in EVENT_ATTRIBUTE_MAP}
+        unknown: list[str] = []
+        for klass in type(handlers).__mro__:
+            if klass is EventAdaptor:
+                break
+            for name, member in vars(klass).items():
+                if (
+                    name.startswith("on_")
+                    and callable(member)
+                    and name not in known
+                    and name not in unknown
+                ):
+                    unknown.append(name)
+        for name in sorted(unknown):
+            print(  # noqa: T201 — student-facing, intentional
+                f"提醒：`{name}` 不是任何 mineflayer 事件，永遠不會被觸發。"  # noqa: RUF001 — zh-TW fullwidth colon
+                "請檢查拼字（例如 on_chat、on_spawn；完整清單見 EventAdaptor 的方法）。",  # noqa: RUF001 — zh-TW fullwidth semicolon
+                flush=True,
+            )
         return handlers
 
     def run_forever(self) -> None:
@@ -440,7 +554,15 @@ def create_bot(
     # instead of the raw yggdrasil stack; also unblocks the wait_spawn below,
     # which would otherwise hang forever since 'spawn' never fires.
     Once(js_bot, BotEvent.ERROR.value)(
-        _normalize_handler(_on_login_error, emitter=js_bot)
+        _normalize_handler(
+            _on_login_error, emitter=js_bot, event_name=BotEvent.ERROR.value
+        )
+    )
+    # Surface the kick reason. mineflayer's logErrors=false (above) plus our
+    # own listeners would otherwise swallow it entirely — a version mismatch
+    # or whitelist kick showed nothing but the generic disconnect line.
+    Once(js_bot, BotEvent.KICKED.value)(
+        _normalize_handler(_on_kicked, emitter=js_bot, event_name=BotEvent.KICKED.value)
     )
     # End the script automatically when the server drops the bot, wherever the
     # main thread happens to be (mid-script or in the keep-alive below). `Once`

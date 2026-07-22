@@ -89,22 +89,35 @@ walking into a wall can't hang the script.
 
 ## Actions (operate on the block/face you're aiming at)
 
-- `dig() -> ((x,y,z), name) | None` — break the aimed block; returns what was
-  broken, or `None` if nothing is in reach. (No argument — it's the renamed
-  "break" action.)
+- `dig() -> ((x,y,z), name) | None` — break the aimed block; if not aiming at
+  one, falls back to the solid block one step ahead. Returns what was broken,
+  `None` when there is nothing solid to break — or when the block is too hard
+  to break in reasonable time (prints a friendly line). (No argument — it's
+  the renamed "break" action.)
 - `place() -> ((x,y,z), name) | None` — place the held block against the aimed
-  face; returns the new block's position+name, or `None`.
+  face; returns the new block's position+name, or `None` when nothing is in
+  reach or the hand is empty (`hold(...)` something first).
 - `use() -> bool` — right-click: interact with the aimed block (door, button,
   lever…), or use the held item if not aiming at a block.
+- `use_player(username) -> bool` — look at the named player's current entity
+  center and right-click it. This reads the live position immediately before
+  interacting, so callers do not calculate yaw/pitch for players at different
+  heights. Returns `True`; raises `PlayerNotFoundError` when the player is
+  offline, in another world, or outside the bot's loaded entity range. The
+  server still enforces its entity-interaction distance.
 - `action(name, value=None) -> None` — ask the **server** to perform a named
   quest action. Sends the vanilla trigger `/trigger <username>_<action>`
   (all lowercased; spaces/hyphens → underscores), with `value` as an optional
   integer payload (`set <value>`). The competition datapack validates the
   request (right bot, quest active, target in front…) and performs or silently
   ignores it — there is **no client-side effect**, so a dropped connection
-  mid-action can never damage the map. Example: bot `G1_labfire` calling
-  `action("put out")` fires `/trigger g1_labfire_put_out`. Bad characters in
-  `name` raise `ValueError`.
+  mid-action can never damage the map. Example: bot `G1_labfire_1` calling
+  `action("put out")` fires `/trigger g1_labfire_1_put_out`. Bad characters in
+  `name` raise `ValueError`. Known labfire actions: `action("put out")`
+  (extinguish the fire in front) and `action("snap")` — in labfire stages 2–3
+  the server takes over movement (slower speed, grid snapping / step
+  rejection); `action("snap")` asks it to align the bot to the current cell
+  centre before turning or moving.
 - `sneak(on: bool) -> bool` — hold (`True`) or release (`False`) sneak; a
   persistent state. Returns the new state.
 

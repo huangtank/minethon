@@ -18,6 +18,7 @@ below cites the api.md / lib section it relies on.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import threading
 import time
@@ -27,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from javascript import Once
 
 from minethon._bridge import get_vec3
-from minethon.errors import NotSpawnedError
+from minethon.errors import NotSpawnedError, PlayerNotFoundError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,15 +45,23 @@ _NON_SOLID = frozenset(
 # Default search radius for find_block / find_blocks.
 # Ref: mineflayer/docs/api.md — bot.findBlocks(options.maxDistance) (default 16).
 _FIND_MAX_DISTANCE = 64
+# dig(): longest break we'll wait for. Anything slower (obsidian bare-handed is
+# 250s; bedrock's Infinity arrives over the bridge as None) gets a friendly
+# "too hard" line instead of a JSPyBridge call timeout mid-dig. Deepslate
+# bare-handed (~15s) fits well under.
+_MAX_DIG_SECONDS = 60.0
+# dig(): margin added on top of mineflayer's digTime estimate, and the floor so
+# short digs keep JSPyBridge's default 10s budget.
+_DIG_TIMEOUT_MARGIN_SECONDS = 5.0
+_DIG_TIMEOUT_FLOOR_SECONDS = 10.0
 
 # Movement: no "walk N blocks" primitive without pathfinder, so move_* presses a
-# control key and polls position until the horizontal distance travelled reaches
-# the target (or a safety timeout fires). 4.317 b/s is vanilla walking speed.
+# control key and polls position until the requested directional progress is
+# reached (or the position stops making progress).
 # Ref: mineflayer/docs/api.md — bot.setControlState; Minecraft physics.
-_WALK_SPEED_BPS = 4.317
 _POLL_SECONDS = 0.05  # ~one physics tick
-_WALK_TIMEOUT_FACTOR = 3.0  # allow 3x the ideal travel time before giving up
-_WALK_TIMEOUT_FLOOR = 1.0  # always allow at least 1s (short hops)
+_WALK_STALL_TIMEOUT = 5.0  # tolerate eight-tick grid locks even near 2 TPS
+_WALK_PROGRESS_EPSILON = 0.01  # ignore packet jitter when refreshing the stall timer
 _JUMP_SECONDS = 0.1  # hold 'jump' briefly to trigger a single hop
 _DEGREES_PER_TURN = 90.0  # turn_left / turn_right default quarter turn
 
@@ -100,11 +109,16 @@ def _make_vec3(x: float, y: float, z: float) -> Any:
     return get_vec3()(x, y, z)
 
 
-def _walk_timeout(blocks: float) -> float:
-    """Safety deadline (seconds) for walking ``blocks`` so a stuck bot stops."""
-    return max(
-        _WALK_TIMEOUT_FLOOR, abs(blocks) / _WALK_SPEED_BPS * _WALK_TIMEOUT_FACTOR
-    )
+def _control_vector(control: str, yaw: float) -> tuple[float, float]:
+    """Horizontal unit vector for a movement control at ``yaw`` radians."""
+    forward_x, forward_z = -math.sin(yaw), -math.cos(yaw)
+    vectors = {
+        "forward": (forward_x, forward_z),
+        "back": (-forward_x, -forward_z),
+        "left": (forward_z, -forward_x),
+        "right": (-forward_z, forward_x),
+    }
+    return vectors[control]
 
 
 def _attribute_value(prop: Any) -> float:
@@ -231,7 +245,15 @@ class Commands:
         try:
             done.wait()
         except KeyboardInterrupt:
-            pass
+            # Ctrl-C while waiting on a login that never spawns: honor the
+            # project's Ctrl-C contract (goodbye line + clean stop) instead of
+            # swallowing the interrupt and letting the script run on with an
+            # un-spawned bot straight into a NotSpawnedError.
+            from minethon import _bot_runtime  # noqa: PLC0415 — avoids an import cycle
+
+            _bot_runtime._stop_with_message(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+                _bot_runtime._GOODBYE  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+            )
 
     def wait(self, seconds: float) -> None:
         """Pause the script for ``seconds`` without the bot going idle.
@@ -340,16 +362,15 @@ class Commands:
         if block is None:
             return None
 
-        # 呼叫 prismarine-block 的 getProperties() 獲取屬性字典
+        # 呼叫 prismarine-block 的 getProperties() 獲取屬性字典。
+        # JSPyBridge 的 JS 物件 Proxy 對不存在的 key 直接回傳 None（不丟例外），
+        # KeyError 只會在 props 是原生 dict 時出現。
+        # bridge / JS 端的錯誤刻意不攔，讓它往上拋，
+        # 避免「連線壞掉」跟「沒有這個屬性」對呼叫端長得一樣。
+        props = block.getProperties()
         try:
-            props = block.getProperties()
-            if props is None:
-                return None
-
-            # JSPyBridge 的 JS 物件 Proxy 支援 dict-like 鍵值存取
-            val = props[property_name]
-            return val if val is not None else None
-        except Exception:  # noqa: BLE001
+            return props[property_name]
+        except KeyError:
             return None
 
     def look_block(self) -> tuple[tuple[int, int, int], str] | None:
@@ -417,20 +438,35 @@ class Commands:
     def _walk(self, control: str, blocks: float) -> tuple[float, float, float]:
         """Hold ``control`` until the bot travels ``blocks`` horizontally.
 
-        Movement is relative to the bot's current facing. Stops early on a
-        safety timeout so walking into a wall can't hang the script.
+        Movement is relative to the bot's facing when the call starts. Progress
+        is measured along that intended direction, so sideways collision drift
+        does not satisfy the requested distance. The timeout is stall-based:
+        every meaningful forward gain refreshes it, allowing long walks and
+        server-authoritative grid locks while still stopping at a wall.
         Ref: mineflayer/docs/api.md — bot.setControlState(control, state).
         """
         if blocks <= 0:
             return self.get_pos()
-        start = self._entity().position
+        entity = self._entity()
+        start = entity.position
         sx, sz = float(start.x), float(start.z)
+        direction_x, direction_z = _control_vector(control, float(entity.yaw))
+        best_progress = 0.0
+        last_progress_at = time.monotonic()
         self._js.setControlState(control, True)
-        deadline = time.monotonic() + _walk_timeout(blocks)
         try:
-            while time.monotonic() < deadline:
+            while True:
                 pos = self._entity().position
-                if math.hypot(float(pos.x) - sx, float(pos.z) - sz) >= blocks:
+                progress = (float(pos.x) - sx) * direction_x + (
+                    float(pos.z) - sz
+                ) * direction_z
+                if progress >= blocks:
+                    break
+                now = time.monotonic()
+                if progress >= best_progress + _WALK_PROGRESS_EPSILON:
+                    best_progress = progress
+                    last_progress_at = now
+                elif now - last_progress_at >= _WALK_STALL_TIMEOUT:
                     break
                 time.sleep(_POLL_SECONDS)
         finally:
@@ -624,9 +660,10 @@ class Commands:
 
         Uses whatever the bot is aiming at; if it isn't aiming at a block (e.g.
         looking straight ahead over flat ground), falls back to the solid block
-        one step forward. Returns ``None`` when there's nothing solid to break.
-        (This renames mineflayer's ``break`` action.)
-        Ref: mineflayer/docs/api.md — bot.dig(block).
+        one step forward. Returns ``None`` when there's nothing solid to break,
+        or when the block is too hard to break in a reasonable time (prints a
+        friendly line in that case). (This renames mineflayer's ``break``
+        action.) Ref: mineflayer/docs/api.md — bot.dig(block), bot.digTime.
         """
         block = self._js.blockAtCursor(_REACH_BLOCKS)
         if block is None:
@@ -635,16 +672,41 @@ class Commands:
             return None
         p = block.position
         result = ((int(p.x), int(p.y), int(p.z)), str(block.name))
-        self._js.dig(block)  # mineflayer looks at the block itself (forceLook)
+        # Long digs (deepslate bare-handed is ~15s) outlive JSPyBridge's 10s
+        # per-call budget: the student got a raw English timeout stack and the
+        # late JS reply then poisoned the bridge IO loop. Size the call timeout
+        # from mineflayer's own estimate; refuse effectively unbreakable blocks.
+        # Unbreakable (bedrock) digTime is Infinity, which the bridge's JSON
+        # serialization delivers as None — float(None) raises, leaving the
+        # sentinel in place, so None routes to the "too hard" line too.
+        dig_ms: float | None = None
+        with contextlib.suppress(Exception):
+            dig_ms = float(self._js.digTime(block))
+        if (
+            dig_ms is None
+            or not math.isfinite(dig_ms)
+            or dig_ms > _MAX_DIG_SECONDS * 1000
+        ):
+            print(f"「{result[1]}」太硬了，挖不動。", flush=True)  # noqa: T201 — student-facing
+            return None
+        timeout = max(
+            _DIG_TIMEOUT_FLOOR_SECONDS, dig_ms / 1000 + _DIG_TIMEOUT_MARGIN_SECONDS
+        )
+        # mineflayer looks at the block itself (forceLook)
+        self._js.dig(block, timeout=timeout)
         return result
 
     @_paced
     def place(self) -> tuple[tuple[int, int, int], str] | None:
         """Place the held block against the face being aimed at.
 
-        Returns the new block's ``((x, y, z), name)`` or ``None`` if nothing is
-        in reach. Ref: mineflayer/docs/api.md — bot.placeBlock(ref, faceVector).
+        Returns the new block's ``((x, y, z), name)``, or ``None`` if nothing
+        is in reach or the hand is empty (hold something first — mineflayer
+        would otherwise throw a raw "must be holding an item" error).
+        Ref: mineflayer/docs/api.md — bot.placeBlock(ref, faceVector).
         """
+        if self._js.heldItem is None:
+            return None
         ref = self._js.blockAtCursor(_REACH_BLOCKS)
         if ref is None:
             return None
@@ -669,6 +731,41 @@ class Commands:
             self._js.activateItem()
         return True
 
+    @_paced
+    def use_player(self, username: str) -> bool:
+        """Right-click the named player's current entity.
+
+        Looks at the center of the player's live bounding box immediately
+        before sending the entity-interaction packet, so callers never need to
+        calculate a yaw/pitch for players at different heights. Raises
+        :class:`PlayerNotFoundError` when the player is offline, in another
+        world, or outside the bot's loaded entity range.
+
+        Ref: mineflayer/docs/api.md — bot.players, bot.lookAt,
+        bot.activateEntity.
+        """
+        self._entity()
+        try:
+            player = self._js.players[username]
+        except IndexError, KeyError, TypeError:
+            player = None
+        target = getattr(player, "entity", None)
+        if target is None or not bool(getattr(target, "isValid", True)):
+            msg = (
+                f"找不到玩家 {username!r}。"
+                "請確認對方在線、與機器人在同一世界，且位於已載入範圍內。"
+            )
+            raise PlayerNotFoundError(msg)
+
+        position = target.position
+        center_y = float(position.y) + float(getattr(target, "height", 1.8)) / 2
+        self._js.lookAt(
+            _make_vec3(float(position.x), center_y, float(position.z)),
+            True,
+        )
+        self._js.activateEntity(target)
+        return True
+
     def sneak(self, on: bool) -> bool:
         """Hold or release sneak (a persistent state); returns ``on``.
 
@@ -686,8 +783,8 @@ class Commands:
         ``/trigger <username>_<action>`` (username lowercased; action
         lowercased with spaces/hyphens collapsed to underscores) and does
         **nothing** client-side — no block edits, no item use, so a lost
-        connection mid-action can never damage the map. Bot ``G1_labfire``
-        calling ``action("put out")`` fires ``/trigger g1_labfire_put_out``.
+        connection mid-action can never damage the map. Bot ``G1_labfire_1``
+        calling ``action("put out")`` fires ``/trigger g1_labfire_1_put_out``.
         ``value``, when given, is attached as the trigger's integer payload
         (``set <value>``) for quests that want a parameter. The competition
         datapack validates the request (right bot, quest active, target in
